@@ -1,0 +1,353 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import time
+import logging
+import schedule
+import json
+from datetime import datetime
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    filename='job_search.log'
+)
+logger = logging.getLogger('job_search_agent')
+
+# Configuration (move to separate config file in production)
+CONFIG = {
+    "search_terms": [
+        "VP Marketing", "CMO", "Chief Marketing Officer", 
+        "Marketing Director", "Head of Marketing", "Executive Marketing"
+    ],
+    "location": "Israel",
+    "excluded_terms": ["junior", "associate", "assistant", "intern"],
+    "email": {
+        "send_from": "your_email@gmail.com",
+        "send_to": "your_email@gmail.com",
+        "password": "your_app_password",  # Use app password for Gmail
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 587
+    },
+    "job_boards": {
+        "linkedin": {
+            "url": "https://www.linkedin.com/jobs/search/?keywords={search_term}&location={location}",
+            "enabled": True
+        },
+        "glassdoor": {
+            "url": "https://www.glassdoor.com/Job/israel-{search_term}-jobs-SRCH_IL.0,6_IN119_KO7,{term_length}.htm",
+            "enabled": True
+        },
+        "indeed": {
+            "url": "https://il.indeed.com/jobs?q={search_term}&l={location}",
+            "enabled": True
+        }
+    },
+    "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    },
+    "schedule": {
+        "time": "08:00",  # Run daily at 8 AM
+        "weekdays_only": True
+    },
+    "database_file": "jobs_database.json"
+}
+
+class JobSearchAgent:
+    def __init__(self, config):
+        self.config = config
+        self.jobs_database = self.load_database()
+        
+    def load_database(self):
+        """Load existing job database or create a new one"""
+        try:
+            with open(self.config["database_file"], "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {"jobs": [], "last_run": None}
+    
+    def save_database(self):
+        """Save the current jobs database"""
+        with open(self.config["database_file"], "w") as f:
+            json.dump(self.jobs_database, f, indent=2)
+    
+    def is_job_new(self, job_id, job_board):
+        """Check if job is already in the database"""
+        for job in self.jobs_database["jobs"]:
+            if job["id"] == job_id and job["source"] == job_board:
+                return False
+        return True
+    
+    def search_linkedin(self, search_term):
+        """Search for jobs on LinkedIn"""
+        jobs = []
+        url = self.config["job_boards"]["linkedin"]["url"].format(
+            search_term=search_term.replace(" ", "%20"),
+            location=self.config["location"].replace(" ", "%20")
+        )
+        
+        try:
+            response = requests.get(url, headers=self.config["headers"])
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            job_listings = soup.find_all('div', class_='base-card relative w-full hover:no-underline focus:no-underline base-card--link base-search-card base-search-card--link job-search-card')
+            
+            for job in job_listings:
+                title_element = job.find('h3', class_='base-search-card__title')
+                company_element = job.find('h4', class_='base-search-card__subtitle')
+                location_element = job.find('span', class_='job-search-card__location')
+                link_element = job.find('a', class_='base-card__full-link')
+                
+                if title_element and company_element and location_element and link_element:
+                    title = title_element.text.strip()
+                    
+                    # Filter out non-executive roles
+                    if any(excluded in title.lower() for excluded in self.config["excluded_terms"]):
+                        continue
+                    
+                    job_id = link_element.get('href').split('?')[0].split('-')[-1]
+                    
+                    if self.is_job_new(job_id, "linkedin"):
+                        jobs.append({
+                            "id": job_id,
+                            "title": title,
+                            "company": company_element.text.strip(),
+                            "location": location_element.text.strip(),
+                            "link": link_element.get('href'),
+                            "source": "linkedin",
+                            "date_found": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+        
+        except Exception as e:
+            logger.error(f"Error searching LinkedIn: {str(e)}")
+        
+        return jobs
+    
+    def search_glassdoor(self, search_term):
+        """Search for jobs on Glassdoor"""
+        jobs = []
+        url = self.config["job_boards"]["glassdoor"]["url"].format(
+            search_term=search_term.replace(" ", "-").lower(),
+            location=self.config["location"].replace(" ", "-").lower(),
+            term_length=len(search_term.replace(" ", "-"))
+        )
+        
+        try:
+            response = requests.get(url, headers=self.config["headers"])
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            job_listings = soup.find_all('li', class_='react-job-listing')
+            
+            for job in job_listings:
+                # Implementation depends on Glassdoor's current HTML structure
+                # You'll need to inspect the site and update selectors
+                title_element = job.find('a', class_='jobLink')
+                company_element = job.find('div', class_='empInfo')
+                
+                if title_element and company_element:
+                    title = title_element.text.strip()
+                    
+                    # Filter out non-executive roles
+                    if any(excluded in title.lower() for excluded in self.config["excluded_terms"]):
+                        continue
+                    
+                    job_id = job.get('data-id', '')
+                    
+                    if self.is_job_new(job_id, "glassdoor"):
+                        jobs.append({
+                            "id": job_id,
+                            "title": title,
+                            "company": company_element.find('span', class_='EmployerName').text.strip(),
+                            "location": company_element.find('span', class_='location').text.strip(),
+                            "link": f"https://www.glassdoor.com/job-listing/{job_id}",
+                            "source": "glassdoor",
+                            "date_found": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+        
+        except Exception as e:
+            logger.error(f"Error searching Glassdoor: {str(e)}")
+        
+        return jobs
+    
+    def search_indeed(self, search_term):
+        """Search for jobs on Indeed"""
+        jobs = []
+        url = self.config["job_boards"]["indeed"]["url"].format(
+            search_term=search_term.replace(" ", "+"),
+            location=self.config["location"].replace(" ", "+")
+        )
+        
+        try:
+            response = requests.get(url, headers=self.config["headers"])
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            job_listings = soup.find_all('div', class_='job_seen_beacon')
+            
+            for job in job_listings:
+                title_element = job.find('h2', class_='jobTitle')
+                company_element = job.find('span', class_='companyName')
+                location_element = job.find('div', class_='companyLocation')
+                
+                if title_element and company_element and location_element:
+                    title = title_element.text.strip()
+                    
+                    # Filter out non-executive roles
+                    if any(excluded in title.lower() for excluded in self.config["excluded_terms"]):
+                        continue
+                    
+                    job_id = job.get('data-jk', '')
+                    
+                    if self.is_job_new(job_id, "indeed"):
+                        jobs.append({
+                            "id": job_id,
+                            "title": title,
+                            "company": company_element.text.strip(),
+                            "location": location_element.text.strip(),
+                            "link": f"https://il.indeed.com/viewjob?jk={job_id}",
+                            "source": "indeed",
+                            "date_found": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+        
+        except Exception as e:
+            logger.error(f"Error searching Indeed: {str(e)}")
+        
+        return jobs
+    
+    def search_jobs(self):
+        """Main function to search for jobs across all platforms"""
+        logger.info("Starting job search...")
+        all_new_jobs = []
+        
+        for search_term in self.config["search_terms"]:
+            logger.info(f"Searching for: {search_term}")
+            
+            # LinkedIn search
+            if self.config["job_boards"]["linkedin"]["enabled"]:
+                linkedin_jobs = self.search_linkedin(search_term)
+                all_new_jobs.extend(linkedin_jobs)
+                logger.info(f"Found {len(linkedin_jobs)} new jobs on LinkedIn")
+            
+            # Glassdoor search
+            if self.config["job_boards"]["glassdoor"]["enabled"]:
+                glassdoor_jobs = self.search_glassdoor(search_term)
+                all_new_jobs.extend(glassdoor_jobs)
+                logger.info(f"Found {len(glassdoor_jobs)} new jobs on Glassdoor")
+            
+            # Indeed search
+            if self.config["job_boards"]["indeed"]["enabled"]:
+                indeed_jobs = self.search_indeed(search_term)
+                all_new_jobs.extend(indeed_jobs)
+                logger.info(f"Found {len(indeed_jobs)} new jobs on Indeed")
+            
+            # Avoid rate limiting
+            time.sleep(5)
+        
+        # Update database with new jobs
+        if all_new_jobs:
+            self.jobs_database["jobs"].extend(all_new_jobs)
+            self.jobs_database["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.save_database()
+            
+            # Send email notification
+            self.send_email_notification(all_new_jobs)
+        
+        logger.info(f"Job search completed. Found {len(all_new_jobs)} new jobs.")
+        return all_new_jobs
+    
+    def send_email_notification(self, new_jobs):
+        """Send email with new job listings"""
+        if not new_jobs:
+            logger.info("No new jobs to send notification for")
+            return
+        
+        try:
+            # Create message
+            msg = MIMEMultipart()
+            msg['From'] = self.config["email"]["send_from"]
+            msg['To'] = self.config["email"]["send_to"]
+            msg['Subject'] = f"New Executive Marketing Jobs in Israel - {len(new_jobs)} positions found"
+            
+            # Create HTML body
+            html = f"""
+            <html>
+            <head>
+                <style>
+                    body {{ font-family: Arial, sans-serif; }}
+                    .job {{ margin-bottom: 20px; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }}
+                    .job h3 {{ margin-top: 0; color: #0066cc; }}
+                    .job p {{ margin: 5px 0; }}
+                    .source {{ color: #666; font-style: italic; }}
+                </style>
+            </head>
+            <body>
+                <h2>New Executive Marketing Jobs Found in Israel</h2>
+                <p>Found {len(new_jobs)} new positions matching your criteria.</p>
+                
+                <div class="jobs">
+            """
+            
+            for job in new_jobs:
+                html += f"""
+                <div class="job">
+                    <h3><a href="{job['link']}">{job['title']}</a></h3>
+                    <p><strong>Company:</strong> {job['company']}</p>
+                    <p><strong>Location:</strong> {job['location']}</p>
+                    <p class="source">Source: {job['source'].capitalize()} - Found on {job['date_found']}</p>
+                </div>
+                """
+            
+            html += """
+                </div>
+                <p>This is an automated message from your Job Search Agent.</p>
+            </body>
+            </html>
+            """
+            
+            msg.attach(MIMEText(html, 'html'))
+            
+            # Connect to server and send
+            server = smtplib.SMTP(self.config["email"]["smtp_server"], self.config["email"]["smtp_port"])
+            server.starttls()
+            server.login(self.config["email"]["send_from"], self.config["email"]["password"])
+            server.send_message(msg)
+            server.quit()
+            
+            logger.info(f"Email notification sent successfully with {len(new_jobs)} jobs")
+        
+        except Exception as e:
+            logger.error(f"Error sending email notification: {str(e)}")
+
+def run_job_search():
+    """Function to be scheduled"""
+    agent = JobSearchAgent(CONFIG)
+    agent.search_jobs()
+
+def main():
+    """Main function to start the agent"""
+    logger.info("Job search agent started")
+    
+    # Run once immediately
+    run_job_search()
+    
+    # Schedule regular runs
+    schedule_time = CONFIG["schedule"]["time"]
+    schedule.every().day.at(schedule_time).do(run_job_search)
+    
+    if CONFIG["schedule"]["weekdays_only"]:
+        # Override weekend schedules
+        schedule.every().saturday.at(schedule_time).do(lambda: None)
+        schedule.every().sunday.at(schedule_time).do(lambda: None)
+    
+    logger.info(f"Job search scheduled to run daily at {schedule_time}")
+    
+    # Keep running
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+if __name__ == "__main__":
+    main()
